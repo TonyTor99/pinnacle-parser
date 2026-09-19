@@ -1,0 +1,16 @@
+[Unit]
+Description=Pinnacle corners signal bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pinnacle-corners-parser
+ExecStart=/opt/pinnacle-corners-parser/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+# collector.py запускается ботом как дочерний процесс; при рестарте сервиса
+# поднять сбор заново кнопкой «▶️ Старт сбора».
+
+[Install]
+WantedBy=multi-user.target
