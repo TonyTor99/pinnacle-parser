@@ -110,6 +110,8 @@ def settings_kb() -> dict:
     row = []
     kb = [[{"text": "💬 Сигналы в этот чат", "callback_data": "setchat"},
            {"text": "✏️ Ввести ID чата", "callback_data": "setchat:ask"}],
+          [{"text": "📋 Мониторинг в этот чат", "callback_data": "setstats"},
+           {"text": "✏️ Ввести ID мониторинга", "callback_data": "setstats:ask"}],
           [{"text": "🔊 Уровень логов:", "callback_data": "noop"}]]
     for name in ("ERROR", "INFO", "LIVE", "DEBUG"):
         mark = "✅ " if name == cur else ""
@@ -141,6 +143,16 @@ SETCHAT_ASK = (
     "⚠️ Бот должен состоять в этом чате (в канал — добавить админом с правом писать).\n"
     "Для отмены пришлите /cancel."
 )
+SETSTATS_ASK = (
+    "✏️ <b>Чат мониторинга перерывов</b>\n\n"
+    "Сюда на каждом перерыве будет падать карточка матча (дата, лига, команды, "
+    "статистика 1Т FlashScore, прематч 1X2 и линии угловых).\n\n"
+    "Пришлите ID чата или @username канала одним сообщением. Примеры:\n"
+    "• <code>-1001234567890</code> — приватный чат/канал\n"
+    "• <code>@my_channel</code> — публичный канал\n\n"
+    "⚠️ Бот должен состоять в этом чате (в канал — админом с правом писать).\n"
+    "Для отмены пришлите /cancel."
+)
 
 
 def _set_signal_chat(target: str) -> bool:
@@ -152,12 +164,23 @@ def _set_signal_chat(target: str) -> bool:
     return ok
 
 
+def _set_stats_chat(target: str) -> bool:
+    """Назначить чат мониторинга перерывов (тест-отправка, сохраняем только при успехе)."""
+    ok = bool(tg.send_message(target, "✅ Этот чат назначен для мониторинга перерывов (HT)."))
+    if ok:
+        storage.set_setting("stats_chat_id", target)
+        log.info("Чат мониторинга задан: %s", target)
+    return ok
+
+
 def settings_text() -> str:
     chat = storage.get_setting("signal_chat_id", config.SIGNAL_CHAT_ID or "не задан")
+    stats_chat = storage.get_setting("stats_chat_id", config.STATS_CHAT_ID or "не задан")
     cur = (storage.get_setting("log_level", logsetup.DEFAULT_LEVEL) or "").upper()
     return (
         "⚙️ <b>Настройки</b>\n\n"
         f"💬 Чат сигналов: <code>{chat}</code>\n"
+        f"📋 Чат мониторинга: <code>{stats_chat}</code>\n"
         f"🔊 Уровень логов: <b>{logsetup.LEVEL_LABELS.get(cur, cur)}</b>\n\n"
         "🟢 Live-матчи — видно доступные матчи в логах сбора.\n"
         "🔵 Отладка — тайминги кнопок и запросов (если бот тормозит).\n"
@@ -175,6 +198,7 @@ def status_text() -> str:
         last_s = f"{dt.strftime('%H:%M:%S')} МСК ({ago}с назад)"
     pinn = storage.get_setting("pinnacle_status", "—")
     chat = storage.get_setting("signal_chat_id", config.SIGNAL_CHAT_ID or "не задан")
+    stats_chat = storage.get_setting("stats_chat_id", config.STATS_CHAT_ID or "не задан")
     err = storage.get_setting("last_error")
     txt = (
         f"📊 <b>Статус сборщика</b>\n"
@@ -182,6 +206,7 @@ def status_text() -> str:
         f"Последний цикл: {last_s}\n"
         f"Pinnacle: {pinn}\n"
         f"Чат сигналов: <code>{chat}</code>\n"
+        f"Чат мониторинга: <code>{stats_chat}</code>\n"
         f"Интервал: {config.POLL_INTERVAL_LIVE}с | окно матчинга: ±{config.MATCH_WINDOW_MIN}м | min КФ: {config.MIN_ODDS}"
     )
     if err:
@@ -252,6 +277,13 @@ def handle_callback(cq):
     elif data == "setchat:ask":
         _awaiting[uid] = "signal_chat"
         tg.edit_message_text(chat_id, msg_id, SETCHAT_ASK, reply_markup=settings_kb())
+    elif data == "setstats":
+        ok = _set_stats_chat(str(chat_id))
+        prefix = "✅ Мониторинг перерывов будет приходить в этот чат.\n\n" if ok else "⚠️ Не удалось назначить чат.\n\n"
+        tg.edit_message_text(chat_id, msg_id, prefix + settings_text(), reply_markup=settings_kb())
+    elif data == "setstats:ask":
+        _awaiting[uid] = "stats_chat"
+        tg.edit_message_text(chat_id, msg_id, SETSTATS_ASK, reply_markup=settings_kb())
     elif data.startswith("log:"):
         level = data.split(":", 1)[1].upper()
         if level in logsetup.LEVELS:
@@ -282,14 +314,18 @@ def handle_callback(cq):
 _CHAT_RE = re.compile(r"^(-?\d+|@[A-Za-z0-9_]{3,})$")
 
 
-def _process_chat_value(chat_id, target: str) -> None:
-    """Проверить введённое значение чата и назначить его (с тест-отправкой)."""
+def _process_chat_value(chat_id, target: str, kind: str = "signal") -> None:
+    """Проверить введённое значение чата и назначить его (с тест-отправкой).
+
+    kind: 'signal' — чат сигналов, 'stats' — чат мониторинга перерывов."""
     if not _CHAT_RE.match(target):
         tg.send_message(chat_id, "⚠️ Не похоже на ID или @username. Пришлите число "
                         "(напр. <code>-1001234567890</code>) или <code>@username</code>, либо /cancel.")
         return
-    if _set_signal_chat(target):
-        tg.send_message(chat_id, f"✅ Чат сигналов задан: <code>{target}</code>", reply_markup=home_kb())
+    setter = _set_stats_chat if kind == "stats" else _set_signal_chat
+    label = "Чат мониторинга" if kind == "stats" else "Чат сигналов"
+    if setter(target):
+        tg.send_message(chat_id, f"✅ {label} задан: <code>{target}</code>", reply_markup=home_kb())
     else:
         tg.send_message(chat_id, f"⚠️ Не удалось отправить в <code>{target}</code>.\n"
                         "Добавьте бота в этот чат (в канал — админом с правом писать) и попробуйте снова.")
@@ -302,20 +338,28 @@ def handle_message(msg):
     if not is_admin(uid):
         return
 
-    # Ожидаем введённый вручную ID чата сигналов
-    if _awaiting.get(uid) == "signal_chat":
+    # Ожидаем введённый вручную ID чата (сигналы или мониторинг)
+    awaiting = _awaiting.get(uid)
+    if awaiting in ("signal_chat", "stats_chat"):
         if text.lower() in ("/cancel", "отмена"):
             _awaiting.pop(uid, None)
             tg.send_message(chat_id, "Отменено.", reply_markup=home_kb())
             return
         _awaiting.pop(uid, None)
-        _process_chat_value(chat_id, text)
+        _process_chat_value(chat_id, text, kind="stats" if awaiting == "stats_chat" else "signal")
         return
 
     if text in ("/start", "/menu", "меню"):
         tg.send_message(chat_id, HOME_TEXT, reply_markup=home_kb())
     elif text == "/status":
         tg.send_message(chat_id, status_text(), reply_markup=home_kb())
+    elif text.startswith("/setstatschat"):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            _process_chat_value(chat_id, parts[1].strip(), kind="stats")
+        else:
+            _awaiting[uid] = "stats_chat"
+            tg.send_message(chat_id, SETSTATS_ASK)
     elif text.startswith("/setchat"):
         parts = text.split(maxsplit=1)
         if len(parts) == 2:

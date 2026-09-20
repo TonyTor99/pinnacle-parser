@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 import logsetup
@@ -27,6 +27,10 @@ PINN_CACHE_TTL = 60          # сек: как часто перечитыват�
 PREMATCH_LOOKAHEAD_H = 8     # ч: для каких прематч-матчей фиксировать 1X2 «первого сканирования»
 PREMATCH_MAX_PER_CYCLE = 30  # ограничение вызовов на цикл
 HT_REPROCESS_TTL = 90        # сек: повторная обработка того же HT-матча не чаще
+HT_NOTIFY_TTL = 3 * 3600     # сек: сколько помнить, что HT-отчёт по матчу уже отправлен (чистка памяти)
+STATS_GRACE = 75             # сек: сколько ждём статистику FlashScore, прежде чем отчитаться «не собралась»
+
+MSK = timezone(timedelta(hours=3))
 
 
 class Collector:
@@ -37,6 +41,8 @@ class Collector:
         self.providers = [FlashScore()]  # порядок = приоритет
         self._pinn_cache = None       # (ts, mains, corner_specials)
         self._processed: dict[str, float] = {}   # ключ события -> ts последней обработки
+        self._ht_notified: dict[str, float] = {}  # ключ события -> ts отправки HT-отчёта (дедуп на перерыв)
+        self._ht_seen: dict[str, float] = {}       # ключ события -> ts первого обнаружения HT (grace для статистики)
         self._auth_notified = False
 
     # --- Pinnacle список с кэшем ---
@@ -108,10 +114,16 @@ class Collector:
 
     def _handle_ht(self, prov, ev, mains, corners):
         key = f"{prov.name}:{ev.event_id}"
+        self._ht_seen.setdefault(key, time.time())
         if self._recently_processed(key):
             return
         stats = prov.get_stats(ev)
         if stats is None:
+            # Статистика ещё не спарсилась — даём несколько циклов на ретрай.
+            # Если за grace-период так и не собралась, шлём в мониторинг «проблемную»
+            # карточку (по данным live-списка), чтобы видеть матчи без статистики FlashScore.
+            if time.time() - self._ht_seen[key] > STATS_GRACE:
+                self._notify_ht(key, None, None, None, None, ev=ev)
             return  # ретрай на следующем цикле (не помечаем обработанным)
 
         # сшивка с Pinnacle (сначала кэш соответствий)
@@ -127,6 +139,9 @@ class Collector:
         if matchup is None:
             logsetup.live(log, "  ❔ не сшит с Pinnacle: %s — %s", ev.home, ev.away)
             storage.save_stats_snapshot(stats, None)
+            # Матч на перерыве, статистика есть, но нет соответствия в Pinnacle (нет линий) —
+            # тоже показываем в мониторинге, со статистикой 1Т и пометкой.
+            self._notify_ht(key, None, stats, None, None, ev=ev)
             self._processed[key] = time.time()
             return
 
@@ -145,6 +160,12 @@ class Collector:
         storage.save_odds_snapshot(matchup.id, is_live=True, minute=stats.minute, rows=_odds_rows(odds))
 
         prematch = storage.get_prematch_moneyline(matchup.id)
+
+        # Отчёт мониторинга: один раз за перерыв шлём в отдельный чат карточку матча
+        # (дата/время, лига, команды, статистика 1Т FlashScore, прематч 1X2, линии угловых) —
+        # чтобы видеть, что по каждому сшитому матчу реально собирается статистика.
+        self._notify_ht(key, matchup, stats, prematch, odds, ev=ev)
+
         cands = signals_mod.evaluate(stats, odds, prematch)
         for c in cands:
             if storage.signal_exists(c.strategy, matchup.id):
@@ -160,6 +181,31 @@ class Collector:
                      c.strategy, matchup.home, matchup.away, c.market, c.price, sent)
 
         self._processed[key] = time.time()
+
+    # --- отчёт мониторинга HT ---
+
+    def _notify_ht(self, key, matchup, stats, prematch, odds, ev=None):
+        """Отправить в чат мониторинга карточку матча на перерыве. Один раз за перерыв.
+
+        matchup/stats/odds могут быть None: карточка тогда строится по live-событию ev
+        (не сшит с Pinnacle либо статистика FlashScore не собралась)."""
+        now = time.time()
+        # чистим устаревшие отметки (матчи давно завершены), чтобы словари не росли
+        for k in [k for k, ts in self._ht_notified.items() if now - ts > HT_NOTIFY_TTL]:
+            del self._ht_notified[k]
+        for k in [k for k, ts in self._ht_seen.items() if now - ts > HT_NOTIFY_TTL]:
+            del self._ht_seen[k]
+        if key in self._ht_notified:
+            return
+        chat = _stats_chat()
+        if not chat:
+            return
+        text = _format_ht_report(matchup, stats, prematch, odds, ev)
+        if tg.send_message(chat, text):
+            self._ht_notified[key] = now
+            home = matchup.home if matchup else (ev.home if ev else "?")
+            away = matchup.away if matchup else (ev.away if ev else "?")
+            logsetup.live(log, "  📋 HT-отчёт отправлен: %s — %s", home, away)
 
     # --- главный цикл ---
 
@@ -258,6 +304,112 @@ def _format_signal(c, matchup, stats) -> str:
 
 def _signal_chat():
     return storage.get_setting("signal_chat_id", config.SIGNAL_CHAT_ID or None)
+
+
+def _stats_chat():
+    return storage.get_setting("stats_chat_id", config.STATS_CHAT_ID or None)
+
+
+def _fmt_kickoff(kickoff_iso) -> str:
+    """ISO-время старта (UTC) -> 'ДД.ММ ЧЧ:ММ МСК'."""
+    if not kickoff_iso:
+        return "время неизвестно"
+    try:
+        dt = datetime.fromisoformat(str(kickoff_iso).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return str(kickoff_iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MSK).strftime("%d.%m %H:%M МСК")
+
+
+def _fmt_corner_lines(odds) -> str:
+    """Компактный блок доступных линий угловых Pinnacle (только основное время, period 0)."""
+    if odds is None:
+        return ""
+
+    def _p0(lst):
+        return [e for e in lst if (e.get("period", 0) or 0) == 0]
+
+    lines: list[str] = []
+
+    totals = sorted(_p0(odds.corner_totals), key=lambda e: (e.get("line") is None, e.get("line")))
+    tt_parts = []
+    for e in totals[:6]:
+        over, under = e.get("over"), e.get("under")
+        cf = "/".join(x for x in ([f"О {over:g}"] if over else []) + ([f"У {under:g}"] if under else []))
+        tt_parts.append(f"{e.get('line'):g} ({cf})" if cf else f"{e.get('line'):g}")
+    if tt_parts:
+        lines.append("   • Тоталы: " + ", ".join(tt_parts))
+
+    hcaps = sorted(_p0(odds.corner_handicaps), key=lambda e: (e.get("line") is None, e.get("line")))
+    hc_parts = []
+    for e in hcaps[:6]:
+        h, a = e.get("home"), e.get("away")
+        cf = "/".join(x for x in ([f"1 {h:g}"] if h else []) + ([f"2 {a:g}"] if a else []))
+        hc_parts.append(f"{e.get('line'):+g} ({cf})" if cf else f"{e.get('line'):+g}")
+    if hc_parts:
+        lines.append("   • Форы: " + ", ".join(hc_parts))
+
+    for side, label in (("home", "ИТ хоз"), ("away", "ИТ гост")):
+        team = sorted([e for e in _p0(odds.corner_team_totals) if e.get("team") == side],
+                      key=lambda e: (e.get("line") is None, e.get("line")))
+        parts = []
+        for e in team[:6]:
+            over, under = e.get("over"), e.get("under")
+            cf = "/".join(x for x in ([f"О {over:g}"] if over else []) + ([f"У {under:g}"] if under else []))
+            parts.append(f"{e.get('line'):g} ({cf})" if cf else f"{e.get('line'):g}")
+        if parts:
+            lines.append(f"   • {label}: " + ", ".join(parts))
+
+    if not lines:
+        return "🚩 Угловые Pinnacle: линий нет"
+    return "🚩 Угловые Pinnacle (осн. время):\n" + "\n".join(lines)
+
+
+def _format_ht_report(matchup, stats, prematch, odds, ev=None) -> str:
+    """Карточка матча на перерыве для чата мониторинга.
+
+    Три режима: полный (сшит + стата + линии), «не сшит с Pinnacle» (есть стата),
+    «нет статистики FlashScore» (только live-событие ev)."""
+    league = (matchup.league if matchup else (ev.league if ev else "")) or "—"
+    home = matchup.home if matchup else (ev.home if ev else "?")
+    away = matchup.away if matchup else (ev.away if ev else "?")
+    kickoff = (matchup.kickoff_utc if matchup else None) or (ev.kickoff_utc if ev else None) \
+        or (stats.kickoff_utc if stats else None)
+
+    head = (
+        f"📋 <b>Перерыв</b> — {_fmt_kickoff(kickoff)}\n"
+        f"🏆 {league}\n"
+        f"⚽ <b>{home} — {away}</b>"
+    )
+
+    if stats is None:
+        return head + "\n⚠️ Статистика FlashScore не собралась (матч на перерыве, данных 1Т нет)."
+
+    hs, as_ = stats.home_stat, stats.away_stat
+    body = (
+        f"\n📊 1Т (FlashScore): голы {hs.goals}:{as_.goals}, "
+        f"🟥 {hs.red_cards}:{as_.red_cards}, угловые {hs.corners}:{as_.corners}"
+    )
+
+    if matchup is None:
+        return head + body + "\n❔ Не сшит с Pinnacle — прематч 1X2 и линии угловых недоступны."
+
+    if prematch and (prematch["prematch_p1"] or prematch["prematch_p2"]):
+        p1 = prematch["prematch_p1"]
+        px = prematch["prematch_px"]
+        p2 = prematch["prematch_p2"]
+        body += (f"\n💹 Прематч 1X2: П1 {p1:g} X {px:g} П2 {p2:g}"
+                 if all(v is not None for v in (p1, px, p2))
+                 else f"\n💹 Прематч 1X2: П1 {p1 or '—'} X {px or '—'} П2 {p2 or '—'}")
+    else:
+        body += "\n💹 Прематч 1X2: не зафиксирован"
+
+    corners = _fmt_corner_lines(odds)
+    if corners:
+        body += "\n" + corners
+    return head + body
 
 
 def _notify_admins(text: str):

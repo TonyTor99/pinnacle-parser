@@ -47,6 +47,7 @@ def _ids(name: str) -> set[int]:
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 ADMIN_IDS = _ids("ADMIN_IDS")
 SIGNAL_CHAT_ID = os.getenv("SIGNAL_CHAT_ID", "").strip()  # хранится в БД/настройках, .env — начальное
+STATS_CHAT_ID = os.getenv("STATS_CHAT_ID", "").strip()    # чат мониторинга HT: отчёт по каждому матчу на перерыве
 
 # --- Pinnacle ---
 PINNACLE_API_KEY = os.getenv("PINNACLE_API_KEY", "").strip()
