@@ -32,7 +32,9 @@ HT_REPROCESS_TTL = 90        # сек: повторная обработка т�
 class Collector:
     def __init__(self):
         self.pinn = PinnacleClient()
-        self.providers = [SofaScore(), FlashScore()]  # порядок = приоритет
+        # SofaScore отключён: блокирует датацентр-IP (403 Varnish) без residential-прокси.
+        # Вернуть запасным после покупки прокси: [FlashScore(), SofaScore()]
+        self.providers = [FlashScore()]  # порядок = приоритет
         self._pinn_cache = None       # (ts, mains, corner_specials)
         self._processed: dict[str, float] = {}   # ключ события -> ts последней обработки
         self._auth_notified = False
