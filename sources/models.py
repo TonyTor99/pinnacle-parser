@@ -71,3 +71,7 @@ class LiveEvent:
     kickoff_utc: str | None
     status: str            # 'live' | 'HT' | 'finished' | ...
     minute: int | None
+    # Голы 1-го тайма, если провайдер отдаёт их прямо в live-списке (FlashScore: BC/BD).
+    # SofaScore оставляет None и считает голы в get_stats. Нужны на HT для стратегий.
+    ht_home_goals: int | None = None
+    ht_away_goals: int | None = None
