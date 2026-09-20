@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import config
@@ -87,12 +88,22 @@ CREATE TABLE IF NOT EXISTS match_map (
 """
 
 
-def _conn() -> sqlite3.Connection:
+@contextmanager
+def _conn():
+    """Соединение с БД как контекстный менеджер: коммит при успехе, ГАРАНТИРОВАННОЕ
+    закрытие в finally. Раньше был `return conn` + `with sqlite3.connect() as c` — но
+    этот with закрывает лишь транзакцию, не само соединение: в длинном цикле сборщика
+    дескрипторы/WAL-файлы копились до SQLITE_CANTOPEN («unable to open database file»).
+    """
     conn = sqlite3.connect(config.DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
