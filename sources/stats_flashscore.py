@@ -46,6 +46,8 @@ class FlashScore(StatsProvider):
             "x-fsign": X_FSIGN,
             "Accept-Language": "en-US,en;q=0.9",
         })
+        if config.STATS_PROXIES:
+            self.sess.proxies.update(config.STATS_PROXIES)
 
     def _get_text(self, path: str, retries: int = 3) -> Optional[str]:
         url = f"{FEED_BASE}{path}"

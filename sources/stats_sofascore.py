@@ -38,6 +38,8 @@ class SofaScore(StatsProvider):
             "Origin": "https://www.sofascore.com",
             "Accept-Language": "en-US,en;q=0.9",
         })
+        if config.STATS_PROXIES:
+            self.sess.proxies.update(config.STATS_PROXIES)
 
     def _get(self, path: str, retries: int = 3) -> Optional[dict]:
         url = f"{API}{path}"

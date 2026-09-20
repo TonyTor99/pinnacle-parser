@@ -53,6 +53,21 @@ PINNACLE_API_KEY = os.getenv("PINNACLE_API_KEY", "").strip()
 PINNACLE_BASE = "https://guest.api.arcadia.pinnacle.com/0.1"
 SOCCER_SPORT_ID = 29  # id футбола в arcadia API
 
+
+# --- Прокси (опционально) ---
+# Стат-сайты (SofaScore/FlashScore) блокируют датацентр-IP, а Pinnacle — некоторые
+# домашние IP. Поэтому прокси задаётся раздельно: STATS_PROXY для статистики,
+# PINNACLE_PROXY для линий. Формат: http://user:pass@host:port или socks5://host:port.
+def _proxies(url: str) -> dict | None:
+    url = (url or "").strip()
+    return {"http": url, "https": url} if url else None
+
+
+STATS_PROXY = os.getenv("STATS_PROXY", "").strip()
+PINNACLE_PROXY = os.getenv("PINNACLE_PROXY", "").strip()
+STATS_PROXIES = _proxies(STATS_PROXY)
+PINNACLE_PROXIES = _proxies(PINNACLE_PROXY)
+
 # --- Параметры сбора ---
 POLL_INTERVAL_LIVE = _int("POLL_INTERVAL_LIVE", 30)
 MATCH_WINDOW_MIN = _int("MATCH_WINDOW_MIN", 20)

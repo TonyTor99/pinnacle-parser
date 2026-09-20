@@ -68,6 +68,8 @@ class PinnacleClient:
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
         })
+        if config.PINNACLE_PROXIES:
+            self.sess.proxies.update(config.PINNACLE_PROXIES)
 
     def _get(self, path: str, params: dict | None = None, retries: int = 4):
         url = f"{self.base}{path}"
