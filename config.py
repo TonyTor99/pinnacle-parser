@@ -1,8 +1,16 @@
 """Конфигурация проекта. Значения читаются из .env (python-dotenv)."""
 import os
+import socket
 from pathlib import Path
 
+import urllib3.util.connection as _urllib3_cn
 from dotenv import load_dotenv
+
+# Форсим IPv4 для всех запросов через requests/urllib3.
+# В WSL2 (NAT) исходящего IPv6 обычно нет: api.telegram.org резолвится в IPv6,
+# коннект висит ~10с и падает как «Temporary failure in name resolution».
+# Патч заставляет резолвер брать только A-записи (IPv4) — чинит и бота, и сборщик.
+_urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")

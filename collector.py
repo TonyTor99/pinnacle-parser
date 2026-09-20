@@ -10,6 +10,7 @@ import traceback
 from datetime import datetime, timezone
 
 import config
+import logsetup
 import signals as signals_mod
 import storage
 import tg
@@ -17,6 +18,10 @@ from matcher import find_matchup, normalize
 from sources.pinnacle import PinnacleAuthError, PinnacleClient
 from sources.stats_flashscore import FlashScore
 from sources.stats_sofascore import SofaScore
+
+# Логи сборщика уходят в stdout — бот перенаправляет их в collector.log
+# (при standalone-запуске видно в консоли). Уровень берётся из settings.
+log = logsetup.setup("collector")
 
 PINN_CACHE_TTL = 60          # сек: как часто перечитывать список матчей Pinnacle
 PREMATCH_LOOKAHEAD_H = 8     # ч: для каких прематч-матчей фиксировать 1X2 «первого сканирования»
@@ -38,7 +43,9 @@ class Collector:
         now = time.time()
         if self._pinn_cache and now - self._pinn_cache[0] < PINN_CACHE_TTL:
             return self._pinn_cache[1], self._pinn_cache[2]
+        t0 = time.monotonic()
         mains, corners = self.pinn.fetch_soccer_matchups()
+        log.debug("Pinnacle: список обновлён за %.0f мс", (time.monotonic() - t0) * 1000)
         self._pinn_cache = (now, mains, corners)
         return mains, corners
 
@@ -77,16 +84,18 @@ class Collector:
         for prov in self.providers:
             try:
                 live = prov.list_live()
-            except Exception:
+            except Exception as e:
+                log.warning("%s: не удалось получить live-список: %s", prov.name, e)
                 continue
-            for ev in live:
-                if ev.status != "HT":
-                    continue
+            ht = [ev for ev in live if ev.status == "HT"]
+            logsetup.live(log, "%s: live=%d, на перерыве (HT)=%d", prov.name, len(live), len(ht))
+            for ev in ht:
                 key = (normalize(ev.home), normalize(ev.away))
                 if key in seen:
                     continue
                 seen.add(key)
                 result.append((prov, ev))
+                logsetup.live(log, "  🕐 HT: [%s] %s — %s (%s)", ev.league, ev.home, ev.away, prov.name)
         return result
 
     def _recently_processed(self, key: str) -> bool:
@@ -114,10 +123,12 @@ class Collector:
                 storage.save_mapping(prov.name, ev.event_id, matchup.id)
 
         if matchup is None:
+            logsetup.live(log, "  ❔ не сшит с Pinnacle: %s — %s", ev.home, ev.away)
             storage.save_stats_snapshot(stats, None)
             self._processed[key] = time.time()
             return
 
+        logsetup.live(log, "  🔗 сшит с Pinnacle #%d: %s — %s", matchup.id, matchup.home, matchup.away)
         storage.upsert_match(matchup.id, matchup.league, matchup.home, matchup.away, matchup.kickoff_utc)
 
         try:
@@ -143,6 +154,8 @@ class Collector:
                 c.strategy, matchup.id, matchup.league, matchup.home, matchup.away,
                 c.market, c.line, c.price, c.details_json(), sent,
             )
+            log.info("🎯 СИГНАЛ %s: %s — %s | %s @ %s (отправлен=%s)",
+                     c.strategy, matchup.home, matchup.away, c.market, c.price, sent)
 
         self._processed[key] = time.time()
 
@@ -150,30 +163,42 @@ class Collector:
 
     def run_once(self):
         mains, corners = self._pinn_data()
+        log.info("Pinnacle: %d матчей (%d с угловыми)", len(mains), len(corners))
         self._capture_prematch(mains, corners)
-        for prov, ev in self._ht_events():
+        ht_events = self._ht_events()
+        for prov, ev in ht_events:
             try:
                 self._handle_ht(prov, ev, mains, corners)
             except PinnacleAuthError:
                 raise
             except Exception:
+                log.error("Ошибка обработки матча:\n%s", traceback.format_exc())
                 storage.set_setting("last_error", traceback.format_exc()[-500:])
+        log.info("Цикл завершён: HT-матчей обработано %d", len(ht_events))
         storage.set_setting("last_cycle_ts", str(int(time.time())))
 
     def run_forever(self):
         storage.init_db()
+        logsetup.apply_level(storage.get_setting("log_level", logsetup.DEFAULT_LEVEL))
+        log.info("Сборщик запущен (интервал %dс, уровень логов %s)",
+                 config.POLL_INTERVAL_LIVE,
+                 (storage.get_setting("log_level", logsetup.DEFAULT_LEVEL) or "").upper())
         while True:
+            # Перечитываем уровень каждый цикл — смена из бота применяется без перезапуска.
+            logsetup.apply_level(storage.get_setting("log_level", logsetup.DEFAULT_LEVEL))
             try:
                 self.run_once()
                 self._auth_notified = False
                 storage.set_setting("pinnacle_status", "ok")
             except PinnacleAuthError as e:
+                log.warning("Pinnacle AUTH_ERROR: %s (обновите PINNACLE_API_KEY)", e)
                 storage.set_setting("pinnacle_status", "AUTH_ERROR")
                 if not self._auth_notified:
                     _notify_admins(f"⚠️ Pinnacle: {e}\nОбновите PINNACLE_API_KEY в .env и перезапустите сбор.")
                     self._auth_notified = True
                 time.sleep(60)
             except Exception:
+                log.error("Ошибка цикла:\n%s", traceback.format_exc())
                 storage.set_setting("last_error", traceback.format_exc()[-500:])
             time.sleep(config.POLL_INTERVAL_LIVE)
 

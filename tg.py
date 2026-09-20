@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any, Optional
 
 import requests
@@ -13,15 +15,27 @@ import config
 
 _API = f"https://api.telegram.org/bot{config.TG_BOT_TOKEN}"
 
+log = logging.getLogger("tg")
 
-def _call(method: str, params: dict, timeout: int = 30) -> Optional[dict]:
+
+def _call(method: str, params: dict, timeout: int = 30, quiet: bool = False) -> Optional[dict]:
+    t0 = time.monotonic()
     try:
         r = requests.post(f"{_API}/{method}", json=params, timeout=timeout)
         data = r.json()
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as e:
+        ms = (time.monotonic() - t0) * 1000
+        log.warning("TG %s: сетевая ошибка за %.0f мс: %s", method, ms, e)
         return None
+    ms = (time.monotonic() - t0) * 1000
     if not data.get("ok"):
+        desc = data.get("description", "")
+        # «message is not modified» — безобидно (повторный edit тем же текстом).
+        lvl = logging.DEBUG if "not modified" in desc else logging.WARNING
+        log.log(lvl, "TG %s: ответ not ok за %.0f мс: %s", method, ms, desc)
         return None
+    if not quiet:
+        log.debug("TG %s: ok за %.0f мс", method, ms)
     return data.get("result")
 
 
@@ -60,7 +74,9 @@ def get_updates(offset: Optional[int], timeout: int = 25) -> list[dict]:
     params = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
     if offset is not None:
         params["offset"] = offset
-    res = _call("getUpdates", params, timeout=timeout + 10)
+    res = _call("getUpdates", params, timeout=timeout + 10, quiet=True)
+    if res:
+        log.debug("getUpdates: получено %d апдейт(ов)", len(res))
     return res or []
 
 
