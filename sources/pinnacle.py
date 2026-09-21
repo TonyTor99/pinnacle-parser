@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -146,7 +147,8 @@ class PinnacleClient:
         """
         data = self._get(f"/sports/{config.SOCCER_SPORT_ID}/matchups") or []
         byid: dict[int, dict] = {}
-        children: dict[int, list[dict]] = defaultdict(list)
+        other_children: dict[int, list[dict]] = defaultdict(list)   # не-угловые дети (чистые имена/лига)
+        corner_children: dict[int, list[dict]] = defaultdict(list)  # угловые спецы (имена с суффиксом «Corners»)
         mains: list[PinnMatch] = []
         corner_specials: dict[int, set[int]] = {}
         for m in data:
@@ -159,16 +161,21 @@ class PinnacleClient:
                 if pm:
                     mains.append(pm)
             if parent is not None:
-                children[parent].append(m)
                 if _is_corner_special(m):
                     corner_specials.setdefault(parent, set()).add(int(mid))
+                    corner_children[parent].append(m)
+                else:
+                    other_children[parent].append(m)
 
         watch: list[PinnWatchMatch] = []
         for pid, corner_ids in corner_specials.items():
+            # Порядок кандидатов = приоритет источника: родитель → не-угловые дети → угловые спецы.
+            # Имена/лигу у угловых спецов Pinnacle помечает суффиксом «(Corners)» — берём их последними.
             cands: list[dict] = []
             if pid in byid:
                 cands.append(byid[pid])
-            cands.extend(children.get(pid, []))
+            cands.extend(other_children.get(pid, []))
+            cands.extend(corner_children.get(pid, []))
             wm = _aggregate_watch(pid, corner_ids, cands)
             if wm:
                 watch.append(wm)
@@ -242,14 +249,24 @@ def _is_corner_special(m: dict) -> bool:
     return "corner" in _corner_text(m)
 
 
+_CORNERS_SUFFIX = re.compile(r"\s*\(?\s*corners\s*\)?\s*$", re.IGNORECASE)
+
+
+def _strip_corners(name: Optional[str]) -> Optional[str]:
+    """Срезать пометку «(Corners)»/«Corners», которой Pinnacle метит угловой спецматчап."""
+    if not name:
+        return name
+    return _CORNERS_SUFFIX.sub("", name).strip() or name
+
+
 def _teams_of(m: dict) -> tuple[Optional[str], Optional[str]]:
     home = away = None
     for p in m.get("participants") or []:
         al = (p.get("alignment") or "").lower()
         if al == "home":
-            home = p.get("name")
+            home = _strip_corners(p.get("name"))
         elif al == "away":
-            away = p.get("name")
+            away = _strip_corners(p.get("name"))
     return home, away
 
 
@@ -284,7 +301,7 @@ def _aggregate_watch(pid: int, corner_ids: set[int], cands: list[dict]) -> Optio
         h, a = _teams_of(m)
         if h and a:
             home, away = h, a
-            league = (m.get("league") or {}).get("name") or league
+            league = _strip_corners((m.get("league") or {}).get("name")) or league
             kickoff = m.get("startTime") or m.get("startsAt") or kickoff
             break
     if not home or not away:
