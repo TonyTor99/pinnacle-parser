@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -23,6 +24,7 @@ import logsetup
 import reports
 import storage
 import tg
+from matcher import _sim, normalize
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 COLLECTOR = os.path.join(BASE, "collector.py")
@@ -97,12 +99,115 @@ def reports_kb() -> dict:
 
 
 def data_kb() -> dict:
+    n = len(storage.list_unmatched(resolved=False))
+    um_label = "⚠️ Не сшитые матчи" + (f" ({n})" if n else "")
     return {"inline_keyboard": [
+        [{"text": um_label, "callback_data": "unmatched"}],
         [{"text": "📥 Экспорт в Excel", "callback_data": "excel"}],
         [{"text": "🧹 Очистить сигналы", "callback_data": "reset:sig"}],
         [{"text": "💣 Стереть всю базу", "callback_data": "reset:all"}],
         [{"text": "« Назад", "callback_data": "tab:home"}],
     ]}
+
+
+# --- «Не сшитые матчи»: ручной алиасинг FlashScore ↔ Pinnacle ---
+
+
+def _fmt_ko(kickoff_iso) -> str:
+    if not kickoff_iso:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(str(kickoff_iso).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return "?"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MSK).strftime("%H:%M")
+
+
+def _btn_short(s: str, limit: int = 28) -> str:
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def unmatched_list_kb() -> dict:
+    rows = []
+    for u in storage.list_unmatched(resolved=False)[:12]:
+        label = _btn_short(f"{u['home']}—{u['away']} ({_fmt_ko(u['kickoff_utc'])})")
+        rows.append([{"text": label, "callback_data": f"um:{u['id']}"}])
+    rows.append([{"text": "« Назад", "callback_data": "tab:data"}])
+    return {"inline_keyboard": rows}
+
+
+def unmatched_list_text() -> str:
+    n = len(storage.list_unmatched(resolved=False))
+    if not n:
+        return ("⚠️ <b>Не сшитые матчи</b>\n\nПусто — все матчи с угловыми на перерыве "
+                "сшивались с FlashScore. 👍")
+    return ("⚠️ <b>Не сшитые матчи</b>\n\n"
+            f"Матчей с угловыми на перерыве, которые не нашлись в FlashScore: <b>{n}</b>.\n"
+            "Выберите матч, чтобы вручную указать соответствие из FS-списка того момента.")
+
+
+def _snapshot(u) -> list[dict]:
+    try:
+        return json.loads(u["fs_snapshot_json"] or "[]")
+    except (ValueError, TypeError):
+        return []
+
+
+def unmatched_detail(u_id: int, show_all: bool):
+    """(текст, клавиатура) экрана выбора FS-кандидата для несшитого матча."""
+    u = storage.get_unmatched(u_id)
+    if u is None or u["resolved"]:
+        return "Запись уже обработана.", unmatched_list_kb()
+    snap = _snapshot(u)
+    ht = [c for c in snap if c.get("status") == "HT"]
+    shown = snap if show_all else (ht or snap)
+    rows = []
+    for c in shown[:16]:
+        idx = snap.index(c)
+        mark = "⏸" if c.get("status") == "HT" else "▶"
+        label = _btn_short(f"{mark} {c.get('home')}—{c.get('away')} {_fmt_ko(c.get('kickoff'))}")
+        rows.append([{"text": label, "callback_data": f"umpick:{u_id}:{idx}"}])
+    if not show_all and len(snap) > len(ht):
+        rows.append([{"text": f"🔽 Показать все живые ({len(snap)})", "callback_data": f"um:{u_id}:all"}])
+    rows.append([{"text": "🗑 Пропустить (удалить)", "callback_data": f"umskip:{u_id}"}])
+    rows.append([{"text": "« Назад", "callback_data": "unmatched"}])
+    text = (
+        "⚠️ <b>Сшивка вручную</b>\n\n"
+        f"🏆 {u['league'] or '—'}\n"
+        f"⚽ Pinnacle: <b>{u['home']} — {u['away']}</b> ({_fmt_ko(u['kickoff_utc'])})\n\n"
+        f"Выберите соответствующий матч из FlashScore ({'все живые' if show_all else 'на перерыве'}):\n"
+        "<i>⏸ — на перерыве, ▶ — идёт. Выбор запишет алиас в aliases.json, "
+        "сборщик подхватит его на следующем перерыве.</i>"
+    )
+    if not shown:
+        text += "\n\n<i>FS-снимок пуст — нечего сопоставлять, можно пропустить.</i>"
+    return text, {"inline_keyboard": rows}
+
+
+def _write_alias(pinn_home, pinn_away, fs_home, fs_away) -> None:
+    """Записать соответствие FS→Pinnacle с учётом возможной перестановки команд."""
+    direct = min(_sim(normalize(pinn_home), normalize(fs_home)),
+                 _sim(normalize(pinn_away), normalize(fs_away)))
+    swap = min(_sim(normalize(pinn_home), normalize(fs_away)),
+               _sim(normalize(pinn_away), normalize(fs_home)))
+    try:
+        with open(config.ALIASES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    if swap > direct:
+        data[fs_home] = pinn_away
+        data[fs_away] = pinn_home
+    else:
+        data[fs_home] = pinn_home
+        data[fs_away] = pinn_away
+    with open(config.ALIASES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    log.info("Алиас записан: %s→%s, %s→%s", fs_home, pinn_home, fs_away, pinn_away)
 
 
 def settings_kb() -> dict:
@@ -307,6 +412,40 @@ def handle_callback(cq):
         storage.reset_all()
         log.info("База полностью очищена")
         tg.edit_message_text(chat_id, msg_id, "🗑 База очищена.\n\n" + DATA_TEXT, reply_markup=data_kb())
+
+    # --- «Не сшитые матчи» ---
+    elif data == "unmatched":
+        tg.edit_message_text(chat_id, msg_id, unmatched_list_text(), reply_markup=unmatched_list_kb())
+    elif data.startswith("um:"):
+        parts = data.split(":")
+        u_id = int(parts[1])
+        show_all = len(parts) > 2 and parts[2] == "all"
+        text, kb = unmatched_detail(u_id, show_all)
+        tg.edit_message_text(chat_id, msg_id, text, reply_markup=kb)
+    elif data.startswith("umpick:"):
+        _, sid, sidx = data.split(":")
+        u = storage.get_unmatched(int(sid))
+        if u is None or u["resolved"]:
+            tg.edit_message_text(chat_id, msg_id, "Запись уже обработана.", reply_markup=unmatched_list_kb())
+        else:
+            snap = _snapshot(u)
+            idx = int(sidx)
+            if 0 <= idx < len(snap):
+                cand = snap[idx]
+                _write_alias(u["home"], u["away"], cand.get("home"), cand.get("away"))
+                storage.mark_unmatched_resolved(int(sid))
+                msg = (f"✅ Соответствие записано:\n"
+                       f"Pinnacle <b>{u['home']} — {u['away']}</b>\n"
+                       f"FlashScore <b>{cand.get('home')} — {cand.get('away')}</b>\n\n"
+                       "Сборщик подхватит алиас на следующем перерыве этого матча.")
+            else:
+                msg = "⚠️ Кандидат не найден в снимке."
+            tg.edit_message_text(chat_id, msg_id, msg, reply_markup=unmatched_list_kb())
+    elif data.startswith("umskip:"):
+        u_id = int(data.split(":")[1])
+        storage.mark_unmatched_resolved(u_id)
+        tg.edit_message_text(chat_id, msg_id, "🗑 Матч пропущен (помечен обработанным).",
+                             reply_markup=unmatched_list_kb())
 
     log.debug("callback %s обработан за %.0f мс", data, (time.monotonic() - t0) * 1000)
 

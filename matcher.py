@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 from datetime import datetime
@@ -22,16 +23,24 @@ _CLUB_TOKENS = {
 }
 
 _aliases_cache: Optional[dict] = None
+_aliases_mtime: float = -1.0
 
 
 def _load_aliases() -> dict:
-    global _aliases_cache
-    if _aliases_cache is None:
+    """aliases.json с авто-перечиткой по mtime: бот дописывает алиасы из «Не сшитых
+    матчей», а сборщик подхватывает их без перезапуска (на следующем перерыве)."""
+    global _aliases_cache, _aliases_mtime
+    try:
+        mtime = os.path.getmtime(config.ALIASES_PATH)
+    except OSError:
+        mtime = -1.0
+    if _aliases_cache is None or mtime != _aliases_mtime:
         try:
             with open(config.ALIASES_PATH, encoding="utf-8") as f:
                 _aliases_cache = json.load(f)
         except (OSError, ValueError):
             _aliases_cache = {}
+        _aliases_mtime = mtime
     return _aliases_cache
 
 
@@ -87,6 +96,32 @@ def find_matchup(event, pinn_mains, window_min: Optional[int] = None,
         if score > best_score:
             best_score = score
             best = pm
+    if best is not None and best_score >= threshold:
+        return best
+    return None
+
+
+def find_fs_event(pinn_home: str, pinn_away: str, pinn_kickoff: Optional[str],
+                  fs_live, window_min: Optional[int] = None, threshold: float = 0.72):
+    """Обратное направление: по матчу Pinnacle найти live-событие стат-провайдера.
+
+    pinn_*: имена/время матча Pinnacle; fs_live: list[LiveEvent]. Возвращает LiveEvent|None.
+    Та же нормализация + прямой/своп + окно времени + aliases, что и в find_matchup.
+    """
+    window_min = config.MATCH_WINDOW_MIN if window_min is None else window_min
+    ph, pa = normalize(pinn_home), normalize(pinn_away)
+    best = None
+    best_score = 0.0
+    for ev in fs_live:
+        if not _kickoff_ok(pinn_kickoff, ev.kickoff_utc, window_min):
+            continue
+        eh, ea = normalize(ev.home), normalize(ev.away)
+        s_direct = min(_sim(ph, eh), _sim(pa, ea))
+        s_swap = min(_sim(ph, ea), _sim(pa, eh))
+        score = max(s_direct, s_swap)
+        if score > best_score:
+            best_score = score
+            best = ev
     if best is not None and best_score >= threshold:
         return best
     return None

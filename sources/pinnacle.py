@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
@@ -50,6 +51,37 @@ class PinnMatch:
     away: str
     kickoff_utc: Optional[str]
     is_live: bool
+
+
+@dataclass
+class PinnWatchMatch:
+    """Live-матч под наблюдением по угловым (сведён из объектов с общим parentId).
+
+    Ведём стратегию «от Pinnacle»: множество наблюдения — матчи, у которых на Pinnacle
+    есть рынок угловых (corner-специалы). Фаза (1Т/перерыв/2Т) берётся из live-state
+    самих объектов, а не из стат-провайдера.
+    """
+    parent_id: int
+    league: str
+    home: str
+    away: str
+    kickoff_utc: Optional[str]
+    corner_ids: set[int] = field(default_factory=set)
+    state: Optional[int] = None       # 1=1Т, 2=перерыв, 3=2Т, None=неизвестно/не live
+    minutes: Optional[int] = None
+    first_half_settled: bool = False  # запасной признак конца 1Т (periods[1].status==settled)
+
+    @property
+    def is_ht(self) -> bool:
+        """Перерыв: явный state==2 либо (нет state, но 1-й тайм уже «settled»)."""
+        return self.state == 2 or (self.state is None and self.first_half_settled)
+
+    def as_main(self) -> "PinnMatch":
+        """PinnMatch для fetch_markets/build_odds (id = parent_id основного матча)."""
+        return PinnMatch(
+            id=self.parent_id, league=self.league, home=self.home, away=self.away,
+            kickoff_utc=self.kickoff_utc, is_live=True,
+        )
 
 
 class PinnacleClient:
@@ -97,23 +129,54 @@ class PinnacleClient:
 
     # --- матчи ---
 
-    def fetch_soccer_matchups(self) -> tuple[list[PinnMatch], dict[int, set[int]]]:
-        """Возвращает (основные матчи, {parent_id -> {corner_special_id,...}}).
+    def fetch_matchups(self) -> tuple[list[PinnMatch], dict[int, set[int]], list[PinnWatchMatch]]:
+        """Один сырой запрос списка → (основные матчи, {parent -> corner_ids}, watch-набор).
 
-        arcadia отдаёт плоский список, где реальные матчи перемешаны со special-подматчапами.
-        Специалы имеют parent (id основного матча); угловые определяем по units/description.
+        arcadia отдаёт плоский список, где реальные матчи перемешаны со special-подматчапами
+        (угловые, тоталы, тайм-специалы) — у специалов есть parentId основного матча.
+
+        - mains: регулярные матчи без родителя (для прематч 1X2 и сшивки со стат-провайдером).
+        - corner_specials: {parent_id -> {corner_special_id,...}} (для build_odds).
+        - watch: live-матчи, у которых есть угловые, со сведённой фазой (state) — по ним
+          ведём стратегию «от Pinnacle» (ловим перерыв здесь, а не в FlashScore).
+
+        Команды/лигу/время и фазу для watch собираем не только из родителя (byid[parent]),
+        но и из его детей: у live-матчей родитель нередко отсутствует в списке, а сами
+        специалы несут participants/league/startTime/state.
         """
-        data = self._get(f"/sports/{config.SOCCER_SPORT_ID}/matchups")
+        data = self._get(f"/sports/{config.SOCCER_SPORT_ID}/matchups") or []
+        byid: dict[int, dict] = {}
+        children: dict[int, list[dict]] = defaultdict(list)
         mains: list[PinnMatch] = []
         corner_specials: dict[int, set[int]] = {}
-        for m in data or []:
+        for m in data:
+            mid = m.get("id")
+            if mid is not None:
+                byid[mid] = m
             parent = _parent_id(m)
             if parent is None and _is_regular(m):
                 pm = _parse_main(m)
                 if pm:
                     mains.append(pm)
-            elif parent is not None and _is_corner_special(m):
-                corner_specials.setdefault(parent, set()).add(int(m["id"]))
+            if parent is not None:
+                children[parent].append(m)
+                if _is_corner_special(m):
+                    corner_specials.setdefault(parent, set()).add(int(mid))
+
+        watch: list[PinnWatchMatch] = []
+        for pid, corner_ids in corner_specials.items():
+            cands: list[dict] = []
+            if pid in byid:
+                cands.append(byid[pid])
+            cands.extend(children.get(pid, []))
+            wm = _aggregate_watch(pid, corner_ids, cands)
+            if wm:
+                watch.append(wm)
+        return mains, corner_specials, watch
+
+    def fetch_soccer_matchups(self) -> tuple[list[PinnMatch], dict[int, set[int]]]:
+        """Совместимость: (основные матчи, {parent_id -> corner_ids}) без watch-набора."""
+        mains, corner_specials, _ = self.fetch_matchups()
         return mains, corner_specials
 
     def fetch_markets(self, matchup_id: int) -> list[dict]:
@@ -177,6 +240,68 @@ def _corner_text(m: dict) -> str:
 
 def _is_corner_special(m: dict) -> bool:
     return "corner" in _corner_text(m)
+
+
+def _teams_of(m: dict) -> tuple[Optional[str], Optional[str]]:
+    home = away = None
+    for p in m.get("participants") or []:
+        al = (p.get("alignment") or "").lower()
+        if al == "home":
+            home = p.get("name")
+        elif al == "away":
+            away = p.get("name")
+    return home, away
+
+
+def _match_state(m: dict) -> tuple[Optional[int], Optional[int]]:
+    """(state, minutes) из живого объекта. state: 1=1Т, 2=перерыв, 3=2Т."""
+    st = m.get("state")
+    if not isinstance(st, dict):
+        return None, None
+    sv = st.get("state")
+    if sv in (1, 2, 3):
+        return sv, st.get("minutes")
+    return None, None
+
+
+def _first_half_settled(m: dict) -> bool:
+    periods = m.get("periods")
+    if not isinstance(periods, list):
+        return False
+    for per in periods:
+        if isinstance(per, dict) and per.get("period") == 1 \
+                and str(per.get("status") or "").lower() == "settled":
+            return True
+    return False
+
+
+def _aggregate_watch(pid: int, corner_ids: set[int], cands: list[dict]) -> Optional[PinnWatchMatch]:
+    """Свести команды/лигу/время и фазу матча из родителя и его детей (первый непустой)."""
+    home = away = None
+    league = ""
+    kickoff = None
+    for m in cands:
+        h, a = _teams_of(m)
+        if h and a:
+            home, away = h, a
+            league = (m.get("league") or {}).get("name") or league
+            kickoff = m.get("startTime") or m.get("startsAt") or kickoff
+            break
+    if not home or not away:
+        return None
+
+    state = minutes = None
+    for m in cands:
+        sv, mins = _match_state(m)
+        if sv is not None:
+            state, minutes = sv, mins
+            break
+
+    fh_settled = any(_first_half_settled(m) for m in cands)
+    return PinnWatchMatch(
+        parent_id=pid, league=league, home=home, away=away, kickoff_utc=kickoff,
+        corner_ids=set(corner_ids), state=state, minutes=minutes, first_half_settled=fh_settled,
+    )
 
 
 def _parse_main(m: dict) -> Optional[PinnMatch]:
@@ -281,9 +406,15 @@ if __name__ == "__main__":
     import sys
 
     cli = PinnacleClient()
-    mains, corners = cli.fetch_soccer_matchups()
+    mains, corners, watch = cli.fetch_matchups()
     live = [m for m in mains if m.is_live]
     print(f"Всего матчей: {len(mains)}, из них live: {len(live)}, у {len(corners)} матчей есть угловые-специалы")
+    phases = {1: "1Т", 2: "ПЕРЕРЫВ", 3: "2Т", None: "—"}
+    print(f"\nWatch-набор (матчи с угловыми): {len(watch)}")
+    for wm in watch:
+        flag = "  ⏸ HT" if wm.is_ht else ""
+        print(f"  #{wm.parent_id} [{phases.get(wm.state, wm.state)} {wm.minutes}'] "
+              f"{wm.home} — {wm.away} ({wm.league}){flag}")
     target = None
     if len(sys.argv) > 1:
         target = next((m for m in mains if m.id == int(sys.argv[1])), None)

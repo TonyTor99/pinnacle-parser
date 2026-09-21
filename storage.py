@@ -85,6 +85,46 @@ CREATE TABLE IF NOT EXISTS match_map (
     ts              INTEGER,
     PRIMARY KEY (source, provider_event)
 );
+
+-- Монитор перерывов: одна карточка на каждый ушедший в перерыв матч с угловыми
+-- (даже если не подошёл под стратегию). Ведём «от Pinnacle».
+CREATE TABLE IF NOT EXISTS ht_monitor (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                INTEGER,
+    matchup_id        INTEGER,          -- id матча Pinnacle (= parent_id)
+    parent_id         INTEGER,
+    league            TEXT,
+    home              TEXT,
+    away              TEXT,
+    ht_home_goals     INTEGER,
+    ht_away_goals     INTEGER,
+    home_reds         INTEGER,
+    away_reds         INTEGER,
+    home_corners      INTEGER,
+    away_corners      INTEGER,
+    prematch_p1       REAL,
+    prematch_px       REAL,
+    prematch_p2       REAL,
+    corner_lines_json TEXT,             -- снимок доступных линий угловых на перерыве
+    verdict           TEXT,             -- какие стратегии подошли / «нет»
+    matched_fs        INTEGER           -- 1=сшит с FlashScore, 0=нет
+);
+CREATE INDEX IF NOT EXISTS idx_htmon_ts ON ht_monitor(ts);
+
+-- Матчи с угловыми на перерыве, которые НЕ нашлись в FlashScore: снимок FS-списка
+-- момента + ручной алиасинг из бота.
+CREATE TABLE IF NOT EXISTS unmatched (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                INTEGER,
+    parent_id         INTEGER,
+    league            TEXT,
+    home              TEXT,
+    away              TEXT,
+    kickoff_utc       TEXT,
+    fs_snapshot_json  TEXT,             -- список FS-событий момента [{id,home,away,kickoff,status}]
+    resolved          INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_unmatched_resolved ON unmatched(resolved, ts);
 """
 
 
@@ -269,6 +309,84 @@ def get_all_signals() -> list[sqlite3.Row]:
         return conn.execute("SELECT * FROM signals ORDER BY ts DESC").fetchall()
 
 
+# --- монитор перерывов (ht_monitor) ---
+
+
+def save_ht_monitor(matchup_id, parent_id, league, home, away,
+                    ht_home_goals, ht_away_goals, home_reds, away_reds,
+                    home_corners, away_corners, prematch_p1, prematch_px, prematch_p2,
+                    corner_lines_json, verdict, matched_fs) -> int:
+    now = int(time.time())
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO ht_monitor(ts, matchup_id, parent_id, league, home, away, "
+            "ht_home_goals, ht_away_goals, home_reds, away_reds, home_corners, away_corners, "
+            "prematch_p1, prematch_px, prematch_p2, corner_lines_json, verdict, matched_fs) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now, matchup_id, parent_id, league, home, away,
+             ht_home_goals, ht_away_goals, home_reds, away_reds, home_corners, away_corners,
+             prematch_p1, prematch_px, prematch_p2, corner_lines_json, verdict,
+             1 if matched_fs else 0),
+        )
+        return cur.lastrowid
+
+
+def get_ht_monitor_since(ts_from: int) -> list[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM ht_monitor WHERE ts>=? ORDER BY ts DESC", (ts_from,)
+        ).fetchall()
+
+
+# --- несшитые матчи (unmatched) ---
+
+
+def get_open_unmatched(parent_id: int) -> Optional[sqlite3.Row]:
+    """Незакрытая запись по матчу (дедуп: один раз за перерыв, живёт до resolved)."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM unmatched WHERE parent_id=? AND resolved=0 ORDER BY ts DESC LIMIT 1",
+            (parent_id,),
+        ).fetchone()
+
+
+def save_unmatched(parent_id, league, home, away, kickoff_utc, fs_snapshot_json) -> Optional[int]:
+    """Сохранить несшитый матч. Если по нему уже есть незакрытая запись — не дублируем."""
+    now = int(time.time())
+    with _conn() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM unmatched WHERE parent_id=? AND resolved=0 LIMIT 1", (parent_id,)
+        ).fetchone()
+        if exists:
+            return None
+        cur = conn.execute(
+            "INSERT INTO unmatched(ts, parent_id, league, home, away, kickoff_utc, fs_snapshot_json) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (now, parent_id, league, home, away, kickoff_utc, fs_snapshot_json),
+        )
+        return cur.lastrowid
+
+
+def list_unmatched(resolved: bool = False) -> list[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM unmatched WHERE resolved=? ORDER BY ts DESC",
+            (1 if resolved else 0,),
+        ).fetchall()
+
+
+def get_unmatched(unmatched_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM unmatched WHERE id=?", (unmatched_id,)
+        ).fetchone()
+
+
+def mark_unmatched_resolved(unmatched_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE unmatched SET resolved=1 WHERE id=?", (unmatched_id,))
+
+
 # --- обслуживание ---
 
 
@@ -279,7 +397,8 @@ def reset_signals() -> None:
 
 def reset_all() -> None:
     with _conn() as conn:
-        for t in ("odds_snapshots", "stats_snapshots", "signals", "match_map", "matches"):
+        for t in ("odds_snapshots", "stats_snapshots", "signals", "match_map",
+                  "ht_monitor", "unmatched", "matches"):
             conn.execute(f"DELETE FROM {t}")
 
 
