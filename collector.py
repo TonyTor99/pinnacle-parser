@@ -415,7 +415,8 @@ def _format_monitor(wm, stats, prematch, odds, matched: set[str]) -> str:
         return (
             "⚪ <b>Нет статистики FS</b>\n"
             f"🏆 {wm.league or '—'} · ⚽ <b>{wm.home} — {wm.away}</b>\n"
-            "⏸ перерыв (Pinnacle), статистика 1Т FlashScore не собралась"
+            "⏸ перерыв на Pinnacle, но FlashScore не отдаёт угловые 1Т по этому матчу.\n"
+            "<i>Обычно лига без детальной статистики в бесплатном фиде — сигнал/резолв невозможны.</i>"
         )
     hs, as_ = stats.home_stat, stats.away_stat
     head = ("🟢 <b>ПОДОШЛА " + ", ".join(sorted(matched)) + "</b>") if matched else "⚪ Не подошла"
