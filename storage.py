@@ -146,9 +146,32 @@ def _conn():
         conn.close()
 
 
+# Колонки signals, добавленные позже (результат сигнала + привязка к TG-сообщению).
+# Добавляются миграцией на существующей БД, чтобы не терять данные.
+_SIGNALS_ADDED_COLUMNS = {
+    "fs_event_id": "TEXT",
+    "result": "TEXT",              # 'win' | 'loss' | 'push'
+    "profit_pct": "REAL",          # прибыль в % банка при ставке 1%
+    "home_corners_final": "INTEGER",
+    "away_corners_final": "INTEGER",
+    "resolved_ts": "INTEGER",
+    "msg_chat_id": "TEXT",         # куда отправлен сигнал (для правки сообщения)
+    "msg_id": "INTEGER",
+    "msg_text": "TEXT",            # исходный текст сигнала (дописываем итог при резолве)
+}
+
+
+def _migrate(conn) -> None:
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(signals)").fetchall()}
+    for col, typ in _SIGNALS_ADDED_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {typ}")
+
+
 def init_db() -> None:
     with _conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 # --- settings ---
@@ -281,13 +304,17 @@ def signal_exists(strategy: str, matchup_id: int) -> bool:
 
 
 def save_signal(strategy: str, matchup_id: int, league: str, home: str, away: str,
-                market: str, line, price, details: str, sent: bool) -> int:
+                market: str, line, price, details: str, sent: bool,
+                fs_event_id: Optional[str] = None, msg_chat_id: Optional[str] = None,
+                msg_id: Optional[int] = None, msg_text: Optional[str] = None) -> int:
     now = int(time.time())
     with _conn() as conn:
         cur = conn.execute(
-            "INSERT INTO signals(ts, strategy, matchup_id, league, home, away, market, line, price, details, sent) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (now, strategy, matchup_id, league, home, away, market, line, price, details, 1 if sent else 0),
+            "INSERT INTO signals(ts, strategy, matchup_id, league, home, away, market, line, price, "
+            "details, sent, fs_event_id, msg_chat_id, msg_id, msg_text) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now, strategy, matchup_id, league, home, away, market, line, price, details,
+             1 if sent else 0, fs_event_id, msg_chat_id, msg_id, msg_text),
         )
         return cur.lastrowid
 
@@ -295,6 +322,26 @@ def save_signal(strategy: str, matchup_id: int, league: str, home: str, away: st
 def set_signal_result(signal_id: int, won: bool) -> None:
     with _conn() as conn:
         conn.execute("UPDATE signals SET won=? WHERE id=?", (1 if won else 0, signal_id))
+
+
+def get_unresolved_signals() -> list[sqlite3.Row]:
+    """Отправленные сигналы с известным FS-событием, по которым ещё нет итога."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM signals WHERE sent=1 AND fs_event_id IS NOT NULL AND resolved_ts IS NULL"
+        ).fetchall()
+
+
+def set_signal_resolved(signal_id: int, won, result: str, profit_pct: float,
+                        home_corners_final, away_corners_final) -> None:
+    """won: 1 (win) | 0 (loss) | None (push). result: 'win'|'loss'|'push'."""
+    now = int(time.time())
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE signals SET won=?, result=?, profit_pct=?, home_corners_final=?, "
+            "away_corners_final=?, resolved_ts=? WHERE id=?",
+            (won, result, profit_pct, home_corners_final, away_corners_final, now, signal_id),
+        )
 
 
 def get_signals_since(ts_from: int) -> list[sqlite3.Row]:

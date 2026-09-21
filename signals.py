@@ -138,3 +138,30 @@ def evaluate(stats: MatchStats, odds: MatchOdds, prematch) -> list[SignalCandida
 
 def _team_dict(t) -> dict:
     return {"goals": t.goals, "reds": t.red_cards, "corners": t.corners}
+
+
+def resolve(strategy: str, line, home_corners: int, away_corners: int) -> str:
+    """Итог ставки по финальным угловым (полный матч). -> 'win' | 'loss' | 'push'.
+
+    itb2: ИТБ2 угловых Over line (целая) → зашла если у гостей угловых > line, возврат если ==.
+    f2:   ФОРА2 угловых -1 (гости -1) → (away-1) vs home; равенство = возврат (целая фора).
+    f1:   ФОРА1 угловых -0.5 (хозяева -0.5) → home vs away; полуфора, возврата нет.
+    """
+    if strategy == "itb2":
+        if line is None:
+            return "loss"
+        if away_corners > line + EPS:
+            return "win"
+        if abs(away_corners - line) <= EPS:
+            return "push"
+        return "loss"
+    if strategy == "f2":
+        margin = (away_corners - 1) - home_corners
+        if margin > EPS:
+            return "win"
+        if abs(margin) <= EPS:
+            return "push"
+        return "loss"
+    if strategy == "f1":
+        return "win" if home_corners > away_corners else "loss"
+    return "loss"

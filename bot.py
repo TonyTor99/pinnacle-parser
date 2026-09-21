@@ -293,6 +293,18 @@ def settings_text() -> str:
     )
 
 
+def _avail(status: Optional[str]) -> str:
+    """Человекочитаемая доступность источника из его *_status в settings."""
+    s = (status or "").lower()
+    if s == "ok":
+        return "🟢 доступен"
+    if s in ("", "—", "none"):
+        return "⚪ нет данных (сбор не запускался)"
+    if s == "auth_error":
+        return "🔴 AUTH_ERROR (обновить ключ)"
+    return f"🔴 недоступен ({status})"
+
+
 def status_text() -> str:
     running = "🟢 работает" if collector_running() else "🔴 остановлен"
     last = storage.get_setting("last_cycle_ts")
@@ -302,6 +314,7 @@ def status_text() -> str:
         ago = int(time.time()) - int(last)
         last_s = f"{dt.strftime('%H:%M:%S')} МСК ({ago}с назад)"
     pinn = storage.get_setting("pinnacle_status", "—")
+    fs = storage.get_setting("fs_status", "—")
     chat = storage.get_setting("signal_chat_id", config.SIGNAL_CHAT_ID or "не задан")
     stats_chat = storage.get_setting("stats_chat_id", config.STATS_CHAT_ID or "не задан")
     err = storage.get_setting("last_error")
@@ -309,7 +322,8 @@ def status_text() -> str:
         f"📊 <b>Статус сборщика</b>\n"
         f"Сбор: {running}\n"
         f"Последний цикл: {last_s}\n"
-        f"Pinnacle: {pinn}\n"
+        f"Pinnacle: {_avail(pinn)}\n"
+        f"FlashScore: {_avail(fs)}\n"
         f"Чат сигналов: <code>{chat}</code>\n"
         f"Чат мониторинга: <code>{stats_chat}</code>\n"
         f"Интервал: {config.POLL_INTERVAL_LIVE}с | окно матчинга: ±{config.MATCH_WINDOW_MIN}м | min КФ: {config.MIN_ODDS}"
@@ -556,6 +570,9 @@ def main():
     log.info("Бот запущен (уровень логов %s)",
              (storage.get_setting("log_level", logsetup.DEFAULT_LEVEL) or "").upper())
     threading.Thread(target=_scheduler, daemon=True).start()
+    # Автозапуск сбора при старте бота (в т.ч. после рестарта сервиса/сервера).
+    auto = start_collector()
+    log.info("Автозапуск сбора: %s", "запущен" if auto else "уже работал")
     for admin in config.ADMIN_IDS:
         tg.send_message(admin, "🤖 <b>Бот запущен.</b>\n\n" + HOME_TEXT, reply_markup=home_kb())
 

@@ -26,20 +26,34 @@ def _period_start_ts(period: str) -> int:
     return int(start.astimezone(timezone.utc).timestamp())
 
 
+def _result(r):
+    """Итог сигнала: явный result (win/loss/push) либо старое поле won (1/0/None)."""
+    try:
+        res = r["result"]
+    except (IndexError, KeyError):
+        res = None
+    if res:
+        return res
+    w = r["won"]
+    return "win" if w == 1 else ("loss" if w == 0 else None)
+
+
 def _agg(rows):
-    won = lost = pending = 0
+    won = lost = push = pending = 0
     profit = 0.0
     for r in rows:
-        w = r["won"]
+        res = _result(r)
         price = r["price"] or 0.0
-        if w is None:
-            pending += 1
-        elif w == 1:
+        if res == "push":
+            push += 1              # возврат: рассчитан, в прибыль 0
+        elif res == "win":
             won += 1
             profit += (price - 1.0)
-        else:
+        elif res == "loss":
             lost += 1
             profit -= 1.0
+        else:
+            pending += 1
     settled = won + lost
     roi = (profit / settled * 100.0) if settled else 0.0
     winrate = (won / settled * 100.0) if settled else 0.0

@@ -104,6 +104,27 @@ class FlashScore(StatsProvider):
             ))
         return events
 
+    # --- статусы всех матчей дня (для резолва результатов) ---
+
+    def event_status_map(self) -> dict[str, str]:
+        """{event_id -> status} по дневному фиду, включая finished (для резолва сигналов)."""
+        text = self._get_text(LIVE_FEED)
+        if not text:
+            return {}
+        out: dict[str, str] = {}
+        for fields in _split_matches(text):
+            mid = _first(fields, K_MATCH_ID)
+            if mid:
+                out[mid] = _status(fields)
+        return out
+
+    def final_corners(self, event_id: str) -> Optional[tuple[int, int]]:
+        """Итоговые угловые за ВЕСЬ матч (первая секция 'Corner kicks' = полный матч)."""
+        text = self._get_text(f"df_st_1_{event_id}")
+        if not text:
+            return None
+        return _stat_pair(text, "corner")
+
     # --- статистика 1-го тайма ---
 
     def get_stats(self, event: LiveEvent) -> Optional[MatchStats]:

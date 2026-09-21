@@ -77,8 +77,10 @@ class Collector:
             return self._fs_cache[1]
         try:
             live = self.provider.list_live()
+            storage.set_setting("fs_status", "ok")
         except Exception as e:
             log.warning("%s: не удалось получить live-список: %s", self.provider.name, e)
+            storage.set_setting("fs_status", "error")
             live = []
         logsetup.live(log, "%s: live=%d (в т.ч. HT=%d)", self.provider.name,
                       len(live), sum(1 for e in live if e.status == "HT"))
@@ -203,16 +205,60 @@ class Collector:
             if storage.signal_exists(c.strategy, pid):
                 continue
             sig_chat = _signal_chat()
-            sent = bool(sig_chat and tg.send_message(sig_chat, _format_signal(c, wm, stats, prematch)))
+            text = _format_signal(c, wm, stats, prematch)
+            res = tg.send_message(sig_chat, text) if sig_chat else None
+            sent = bool(res)
+            msg_id = res.get("message_id") if isinstance(res, dict) else None
             storage.save_signal(
                 c.strategy, pid, wm.league, wm.home, wm.away,
                 c.market, c.line, c.price, c.details_json(), sent,
+                fs_event_id=ev.event_id,
+                msg_chat_id=str(sig_chat) if sig_chat else None, msg_id=msg_id, msg_text=text,
             )
             log.info("🎯 СИГНАЛ %s: %s — %s | %s @ %s (отправлен=%s)",
                      c.strategy, wm.home, wm.away, c.market, c.price, sent)
 
         tag = "ПОДОШЛА " + ",".join(sorted(matched)) if matched else ("нет статистики" if stats is None else "не подошла")
         logsetup.live(log, "  📋 HT %s — %s [%s]", wm.home, wm.away, tag)
+
+    # --- резолв результатов по завершении матча ---
+
+    def _resolve_signals(self):
+        """Досчитать итог отправленных сигналов: по финальным угловым FlashScore
+        определить зашла/не зашла/возврат, записать в БД и дописать в сообщение сигнала."""
+        rows = storage.get_unresolved_signals()
+        if not rows:
+            return
+        try:
+            status_map = self.provider.event_status_map()
+        except Exception as e:
+            log.warning("резолв: не удалось получить статусы FS: %s", e)
+            return
+        for r in rows:
+            eid = r["fs_event_id"]
+            if status_map.get(eid) != "finished":
+                continue
+            corners = self.provider.final_corners(eid)
+            if corners is None:
+                continue
+            hc, ac = corners
+            result = signals_mod.resolve(r["strategy"], r["line"], hc, ac)
+            won = 1 if result == "win" else (0 if result == "loss" else None)
+            price = r["price"] or 0.0
+            profit = round(price - 1.0, 2) if result == "win" else (-1.0 if result == "loss" else 0.0)
+            storage.set_signal_resolved(r["id"], won, result, profit, hc, ac)
+            self._append_result_to_msg(r, result, profit, hc, ac)
+            log.info("🏁 РЕЗОЛВ %s: %s — %s | угл %d:%d → %s (%+.2f%%)",
+                     r["strategy"], r["home"], r["away"], hc, ac, result, profit)
+
+    def _append_result_to_msg(self, r, result, profit, hc, ac):
+        chat, mid, base = r["msg_chat_id"], r["msg_id"], r["msg_text"]
+        if not (chat and mid and base):
+            return
+        try:
+            tg.edit_message_text(chat, mid, base + "\n\n" + _format_result_line(result, profit, hc, ac))
+        except Exception as e:
+            log.warning("резолв: не удалось дописать сообщение сигнала: %s", e)
 
     # --- главный цикл ---
 
@@ -238,6 +284,10 @@ class Collector:
             except Exception:
                 log.error("Ошибка обработки матча %s:\n%s", wm.parent_id, traceback.format_exc())
                 storage.set_setting("last_error", traceback.format_exc()[-500:])
+        try:
+            self._resolve_signals()
+        except Exception:
+            log.error("Ошибка резолва сигналов:\n%s", traceback.format_exc())
         self._cleanup_mem()
         log.info("Цикл завершён: HT-матчей %d", len(ht))
         storage.set_setting("last_cycle_ts", str(int(time.time())))
@@ -383,6 +433,12 @@ def _format_monitor(wm, stats, prematch, odds, matched: set[str]) -> str:
     if not _has_corner_lines(odds):
         lines.append("⚠️ линий угловых нет (окно закрылось)")
     return "\n".join(lines)
+
+
+def _format_result_line(result: str, profit: float, hc: int, ac: int) -> str:
+    label = {"win": "✅ Зашла", "loss": "❌ Не зашла", "push": "➖ Возврат"}.get(result, result)
+    return (f"🏁 Итог: угловые {hc}:{ac} (Σ{hc + ac}) · <b>{label}</b> · "
+            f"<b>{profit:+.2f}%</b> (ставка 1%)")
 
 
 def _format_unmatched(wm) -> str:
