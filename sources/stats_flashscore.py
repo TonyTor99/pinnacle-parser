@@ -8,10 +8,10 @@
 - Список матчей: feed f_1_0_3_en_1 на host global.flashscore.ninja/2/x/feed.
 - Матч начинается с AA (id). Команды: AE (home) / AF (away). Время старта: AD (unix).
 - Статус матча AB: 1=прематч, 2=live, 3=завершён.
-- Стадия AC: 12=1-й тайм, 38=ПЕРЕРЫВ, 13=2-й тайм.
-- Счёт: AG/AH — текущий; BC/BD — счёт 1-го тайма, НО FlashScore заполняет его только
-  со стартом 2-го тайма: на перерыве BC/BD пустые (проверено 2026-11-03). Поэтому
-  ПЕРЕРЫВ (HT) = live (AB=2) + стадия AC=38, а голы 1-го тайма на перерыве = текущий
+- Стадия AC: 12=1-й тайм, 38=ПЕРЕРЫВ, 13=2-й тайм (переходы 12→38→13 сняты вживую 2026-11-03).
+- Счёт: AG/AH — текущий; BC/BD — счёт 2-го ТАЙМА (не 1-го!): пусто до его старта, дальше растёт
+  с голами 2-го тайма (Damac — Al Okhdood: перерыв 1:2, затем общий 2:2 при BC/BD 1:0).
+  Поэтому ПЕРЕРЫВ (HT) = live (AB=2) + стадия AC=38, а голы 1-го тайма на перерыве = текущий
   счёт AG/AH. (Старый инвариант «BC/BD есть и AC≠13» на перерыве не срабатывал никогда.)
 - Статистика: feed df_st_1_{id}. Секции '~', внутри SG=название, SH=home, SI=away.
   На перерыве это статистика ровно за 1-й тайм (2-й ещё не начался) — что и нужно.
@@ -42,8 +42,6 @@ K_AWAY = ("AF", "WN")
 K_START = ("AD", "ADE")
 K_STATUS = ("AB",)            # 1=прематч, 2=live, 3=завершён
 K_STAGE = ("AC",)            # 12=1-й тайм, 38=перерыв, 13=2-й тайм
-K_HT_HOME = ("BC",)          # голы хозяев за 1-й тайм (пусто до старта 2-го тайма)
-K_HT_AWAY = ("BD",)          # голы гостей за 1-й тайм
 K_SCORE_HOME = ("AG",)       # текущий счёт хозяев (на перерыве = голы 1-го тайма)
 K_SCORE_AWAY = ("AH",)
 STAGE_HT = "38"
@@ -97,10 +95,9 @@ class FlashScore(StatsProvider):
             status = _status(fields)
             if status not in ("live", "HT"):
                 continue  # драйверу нужны только идущие матчи
-            ht_home = _int_or_none(_first(fields, K_HT_HOME))
-            ht_away = _int_or_none(_first(fields, K_HT_AWAY))
-            if status == "HT" and (ht_home is None or ht_away is None):
-                # на перерыве BC/BD ещё пустые — голы 1-го тайма = текущий счёт
+            ht_home = ht_away = None
+            if status == "HT":
+                # на перерыве голы 1-го тайма = текущий счёт (BC/BD у FlashScore — 2-й тайм)
                 ht_home = _int_or_none(_first(fields, K_SCORE_HOME))
                 ht_away = _int_or_none(_first(fields, K_SCORE_AWAY))
             events.append(LiveEvent(
@@ -151,7 +148,7 @@ class FlashScore(StatsProvider):
             # без угловых сигнал по угловым не построить — безопасный пропуск
             return None
         reds = _stat_pair(text, "red card") or (0, 0)
-        # Голы 1-го тайма надёжнее берём из ht-счёта основного фида (BC/BD).
+        # Голы 1-го тайма — из основного фида (счёт на перерыве, см. list_live).
         hg = event.ht_home_goals if event.ht_home_goals is not None else 0
         ag = event.ht_away_goals if event.ht_away_goals is not None else 0
         return MatchStats(
