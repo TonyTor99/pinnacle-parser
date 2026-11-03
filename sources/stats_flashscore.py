@@ -8,12 +8,15 @@
 - Список матчей: feed f_1_0_3_en_1 на host global.flashscore.ninja/2/x/feed.
 - Матч начинается с AA (id). Команды: AE (home) / AF (away). Время старта: AD (unix).
 - Статус матча AB: 1=прематч, 2=live, 3=завершён.
-- Стадия AC: 12=1-й тайм (ht-счёт ещё пуст), 13=2-й тайм (ht-счёт заполнен).
-- Счёт: AG/AH — текущий; BC/BD — счёт 1-го тайма (появляется на перерыве и остаётся).
-- ПЕРЕРЫВ (HT) определяем по инварианту, не завися от точного кода стадии:
-  матч live (AB=2) + счёт 1-го тайма уже есть (BC/BD) + это ещё не 2-й тайм (AC≠13).
+- Стадия AC: 12=1-й тайм, 38=ПЕРЕРЫВ, 13=2-й тайм.
+- Счёт: AG/AH — текущий; BC/BD — счёт 1-го тайма, НО FlashScore заполняет его только
+  со стартом 2-го тайма: на перерыве BC/BD пустые (проверено 2026-11-03). Поэтому
+  ПЕРЕРЫВ (HT) = live (AB=2) + стадия AC=38, а голы 1-го тайма на перерыве = текущий
+  счёт AG/AH. (Старый инвариант «BC/BD есть и AC≠13» на перерыве не срабатывал никогда.)
 - Статистика: feed df_st_1_{id}. Секции '~', внутри SG=название, SH=home, SI=away.
   На перерыве это статистика ровно за 1-й тайм (2-й ещё не начался) — что и нужно.
+- Дневные фиды f_1_{день}_3_en_1 режут сутки не по полуночи: поздний матч после финала
+  может оказаться только во «вчерашнем» (-1) — статусы для резолва берём из обоих.
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from .stats_base import StatsProvider
 FEED_BASE = "https://global.flashscore.ninja/2/x/feed"
 X_FSIGN = "SW9D1eZo"          # TUNE: публичный статический токен фидов FlashScore
 LIVE_FEED = "f_1_0_3_en_1"    # футбол (sport 1), обзорный фид со всеми матчами дня
+PREV_DAY_FEED = "f_1_-1_3_en_1"  # вчерашний — туда уходят поздние матчи после финала
 
 # TUNE: кандидаты кодов полей (перебор по порядку — берём первый непустой)
 K_MATCH_ID = ("AA",)
@@ -37,9 +41,12 @@ K_HOME = ("AE", "CX", "WM")
 K_AWAY = ("AF", "WN")
 K_START = ("AD", "ADE")
 K_STATUS = ("AB",)            # 1=прематч, 2=live, 3=завершён
-K_STAGE = ("AC",)            # 12=1-й тайм, 13=2-й тайм
-K_HT_HOME = ("BC",)          # голы хозяев за 1-й тайм
+K_STAGE = ("AC",)            # 12=1-й тайм, 38=перерыв, 13=2-й тайм
+K_HT_HOME = ("BC",)          # голы хозяев за 1-й тайм (пусто до старта 2-го тайма)
 K_HT_AWAY = ("BD",)          # голы гостей за 1-й тайм
+K_SCORE_HOME = ("AG",)       # текущий счёт хозяев (на перерыве = голы 1-го тайма)
+K_SCORE_AWAY = ("AH",)
+STAGE_HT = "38"
 
 
 class FlashScore(StatsProvider):
@@ -90,6 +97,12 @@ class FlashScore(StatsProvider):
             status = _status(fields)
             if status not in ("live", "HT"):
                 continue  # драйверу нужны только идущие матчи
+            ht_home = _int_or_none(_first(fields, K_HT_HOME))
+            ht_away = _int_or_none(_first(fields, K_HT_AWAY))
+            if status == "HT" and (ht_home is None or ht_away is None):
+                # на перерыве BC/BD ещё пустые — голы 1-го тайма = текущий счёт
+                ht_home = _int_or_none(_first(fields, K_SCORE_HOME))
+                ht_away = _int_or_none(_first(fields, K_SCORE_AWAY))
             events.append(LiveEvent(
                 source=self.name,
                 event_id=mid,
@@ -99,23 +112,25 @@ class FlashScore(StatsProvider):
                 kickoff_utc=_iso(_first(fields, K_START)),
                 status=status,
                 minute=45 if status == "HT" else None,
-                ht_home_goals=_int_or_none(_first(fields, K_HT_HOME)),
-                ht_away_goals=_int_or_none(_first(fields, K_HT_AWAY)),
+                ht_home_goals=ht_home,
+                ht_away_goals=ht_away,
             ))
         return events
 
     # --- статусы всех матчей дня (для резолва результатов) ---
 
     def event_status_map(self) -> dict[str, str]:
-        """{event_id -> status} по дневному фиду, включая finished (для резолва сигналов)."""
-        text = self._get_text(LIVE_FEED)
-        if not text:
-            return {}
+        """{event_id -> status} по сегодняшнему и вчерашнему фидам, включая finished
+        (для резолва сигналов). Сегодняшний свежее — при совпадении id он главный."""
         out: dict[str, str] = {}
-        for fields in _split_matches(text):
-            mid = _first(fields, K_MATCH_ID)
-            if mid:
-                out[mid] = _status(fields)
+        for feed in (LIVE_FEED, PREV_DAY_FEED):
+            text = self._get_text(feed)
+            if not text:
+                continue
+            for fields in _split_matches(text):
+                mid = _first(fields, K_MATCH_ID)
+                if mid:
+                    out.setdefault(mid, _status(fields))
         return out
 
     def final_corners(self, event_id: str) -> Optional[tuple[int, int]]:
@@ -186,16 +201,12 @@ def _first(fields: dict[str, str], keys) -> str:
 def _status(fields: dict[str, str]) -> str:
     ab = fields.get("AB")
     ac = fields.get("AC")
-    ht = fields.get("BC")
     if ab == "3":
         return "finished"
     if ab == "1":
         return "prematch"
     if ab == "2":
-        # перерыв: 1-й тайм отыгран (есть ht-счёт), 2-й ещё не идёт
-        if ht not in (None, "") and ac != "13":
-            return "HT"
-        return "live"
+        return "HT" if ac == STAGE_HT else "live"
     return "other"
 
 

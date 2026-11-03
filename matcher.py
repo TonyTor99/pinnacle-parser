@@ -22,6 +22,10 @@ _CLUB_TOKENS = {
     "ud", "as", "ss", "us", "rc", "kf", "nk", "hk", "sd", "cs", "club", "de", "the",
 }
 
+# FlashScore в международных турнирах дописывает страну: «Kyoto (Jpn)», «Shanghai Port (Chn)».
+# У Pinnacle её нет («Kyoto Sanga») — без среза сходство падает ниже порога и матч не сшивается.
+_COUNTRY_SUFFIX = re.compile(r"\s*\([A-Z][a-z]{2}\)")
+
 _aliases_cache: Optional[dict] = None
 _aliases_mtime: float = -1.0
 
@@ -48,6 +52,7 @@ def normalize(name: str) -> str:
     if not name:
         return ""
     name = _load_aliases().get(name, name)
+    name = _COUNTRY_SUFFIX.sub(" ", name)
     n = unicodedata.normalize("NFKD", name)
     n = "".join(c for c in n if not unicodedata.combining(c))
     n = n.lower()

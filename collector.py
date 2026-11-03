@@ -38,6 +38,7 @@ PREMATCH_MAX_PER_CYCLE = 30  # ограничение вызовов на цик
 FS_GRACE = 60                # сек: сколько ждём появления матча в FlashScore, прежде чем «не сшит»
 STATS_GRACE = 90             # сек: сколько ждём HT-статистику FlashScore, прежде чем отчитаться
 HT_MEM_TTL = 3 * 3600        # сек: сколько помнить обработанный перерыв (чистка словарей)
+RESOLVE_EVERY = 300          # сек: как часто досчитывать итоги сигналов (2 дневных фида FS за раз)
 
 STRATEGY_NAMES = {"itb2": "itb2", "f2": "f2", "f1": "f1"}
 MSK = timezone(timedelta(hours=3))
@@ -56,6 +57,7 @@ class Collector:
         self._ht_seen: dict[int, float] = {}    # pid -> ts первого HT (grace)
         self._ht_odds: dict[int, object] = {}   # pid -> MatchOdds (снимок линий, один раз)
         self._ht_done: dict[int, float] = {}    # pid -> ts финализации (дедуп на перерыв)
+        self._last_resolve = 0.0                # ts последнего досчёта итогов
         self._auth_notified = False
 
     # --- Pinnacle список с кэшем ---
@@ -284,10 +286,12 @@ class Collector:
             except Exception:
                 log.error("Ошибка обработки матча %s:\n%s", wm.parent_id, traceback.format_exc())
                 storage.set_setting("last_error", traceback.format_exc()[-500:])
-        try:
-            self._resolve_signals()
-        except Exception:
-            log.error("Ошибка резолва сигналов:\n%s", traceback.format_exc())
+        if time.time() - self._last_resolve >= RESOLVE_EVERY:
+            self._last_resolve = time.time()
+            try:
+                self._resolve_signals()
+            except Exception:
+                log.error("Ошибка резолва сигналов:\n%s", traceback.format_exc())
         self._cleanup_mem()
         log.info("Цикл завершён: HT-матчей %d", len(ht))
         storage.set_setting("last_cycle_ts", str(int(time.time())))
