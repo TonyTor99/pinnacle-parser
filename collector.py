@@ -137,7 +137,7 @@ class Collector:
 
         # 2. Сшивка с FlashScore по именам (нормализация + прямой/своп + окно времени + aliases).
         fs_live = self._fs_live()
-        ev = find_fs_event(wm.home, wm.away, wm.kickoff_utc, fs_live)
+        ev = find_fs_event(wm.home, wm.away, wm.kickoff_utc, fs_live, pinn_league=wm.league)
 
         if ev is None:
             # Не нашли в FS — даём немного времени (FS мог ещё не показать матч), потом фиксируем.

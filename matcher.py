@@ -26,6 +26,12 @@ _CLUB_TOKENS = {
 # У Pinnacle её нет («Kyoto Sanga») — без среза сходство падает ниже порога и матч не сшивается.
 _COUNTRY_SUFFIX = re.compile(r"\s*\([A-Z][a-z]{2}\)")
 
+# Вторые составы пишут по-разному: Pinnacle «Genk II», FlashScore «Genk U23» — сводим к одному токену.
+_RESERVE_TOKENS = {"ii": "res", "u21": "res", "u23": "res"}
+
+# Сходство «по сокращениям» (см. _abbr_sim) — ниже точного/вложенного (1.0/0.92), выше порога 0.72.
+ABBR_SCORE = 0.9
+
 _aliases_cache: Optional[dict] = None
 _aliases_mtime: float = -1.0
 
@@ -57,7 +63,7 @@ def normalize(name: str) -> str:
     n = "".join(c for c in n if not unicodedata.combining(c))
     n = n.lower()
     n = re.sub(r"[^a-z0-9 ]+", " ", n)
-    tokens = [t for t in n.split() if t and t not in _CLUB_TOKENS]
+    tokens = [_RESERVE_TOKENS.get(t, t) for t in n.split() if t and t not in _CLUB_TOKENS]
     return " ".join(tokens)
 
 
@@ -68,7 +74,44 @@ def _sim(a: str, b: str) -> float:
         return 1.0
     if a in b or b in a:
         return 0.92
-    return SequenceMatcher(None, a, b).ratio()
+    return max(SequenceMatcher(None, a, b).ratio(), _abbr_sim(a, b))
+
+
+def _abbr_sim(a: str, b: str) -> float:
+    """Сокращения FlashScore: «U. Cluj» = Universitatea Cluj, «UC Dublin» = University College
+    Dublin, «Ind. Medellin», «Dag & Red» = Dagenham and Redbridge, «Zacatecas Mineros» =
+    Mineros de Zacatecas. Каждое слово более короткого названия должно найтись в длинном —
+    целиком, началом слова (от 3 букв) или инициалами подряд идущих слов. Плюс хотя бы 4
+    буквы совпали не инициалами, иначе «U.» совпадало бы с любым «United»."""
+    ta, tb = a.split(), b.split()
+    if len(ta) > len(tb):
+        ta, tb = tb, ta
+    s = _abbr_cover(ta, tb)
+    if not s and len(ta) == len(tb):            # «u cluj» / «universitatea cluj»: сокращение может быть с любой стороны
+        s = _abbr_cover(tb, ta)
+    return s
+
+
+def _abbr_cover(ta: list[str], tb: list[str]) -> float:
+    """Все слова ta нашлись в tb (целиком / началом / инициалами) → ABBR_SCORE, иначе 0."""
+    used = [False] * len(tb)
+    solid = 0                                   # буквы, совпавшие словами/началами слов
+    for t in ta:
+        j = next((j for j, u in enumerate(tb) if not used[j] and
+                  (t == u or (len(t) >= 3 and u.startswith(t)) or (len(u) >= 3 and t.startswith(u)))), None)
+        if j is not None:
+            used[j] = True
+            solid += min(len(t), len(tb[j]))
+            continue
+        if len(t) <= 3:                         # инициалы: «u» -> universitatea, «uc» -> university college
+            j = next((j for j in range(len(tb) - len(t) + 1)
+                      if not any(used[j:j + len(t)]) and all(tb[j + k].startswith(t[k]) for k in range(len(t)))), None)
+            if j is not None:
+                for k in range(len(t)):
+                    used[j + k] = True
+                continue
+        return 0.0
+    return ABBR_SCORE if solid >= 4 else 0.0
 
 
 def _kickoff_ok(ev_iso: Optional[str], pm_iso: Optional[str], window_min: int) -> bool:
@@ -107,26 +150,46 @@ def find_matchup(event, pinn_mains, window_min: Optional[int] = None,
 
 
 def find_fs_event(pinn_home: str, pinn_away: str, pinn_kickoff: Optional[str],
-                  fs_live, window_min: Optional[int] = None, threshold: float = 0.72):
+                  fs_live, window_min: Optional[int] = None, threshold: float = 0.72,
+                  pinn_league: str = ""):
     """Обратное направление: по матчу Pinnacle найти live-событие стат-провайдера.
 
-    pinn_*: имена/время матча Pinnacle; fs_live: list[LiveEvent]. Возвращает LiveEvent|None.
-    Та же нормализация + прямой/своп + окно времени + aliases, что и в find_matchup.
+    pinn_*: имена/время/лига матча Pinnacle; fs_live: list[LiveEvent]. Возвращает LiveEvent|None.
+    Та же нормализация + прямой/своп + окно времени + aliases, что и в find_matchup, плюс:
+    - женская лига Pinnacle → у команд FlashScore срезаем « W» (Pinnacle «Toluca», FS «Toluca W»);
+    - время старта у Pinnacle бывает сдвинуто на часы («Cherno More — Botev Vratsa»: 16:30 против
+      15:00) — вне окна принимаем только почти точные имена (≥ ABBR_SCORE) у события FS,
+      которое тоже на перерыве (ищем ведь в момент перерыва на Pinnacle).
     """
     window_min = config.MATCH_WINDOW_MIN if window_min is None else window_min
     ph, pa = normalize(pinn_home), normalize(pinn_away)
+    women = _is_women_league(pinn_league)
     best = None
     best_score = 0.0
     for ev in fs_live:
-        if not _kickoff_ok(pinn_kickoff, ev.kickoff_utc, window_min):
-            continue
         eh, ea = normalize(ev.home), normalize(ev.away)
+        if women:
+            eh, ea = _strip_women(eh), _strip_women(ea)
         s_direct = min(_sim(ph, eh), _sim(pa, ea))
         s_swap = min(_sim(ph, ea), _sim(pa, eh))
         score = max(s_direct, s_swap)
+        if not _kickoff_ok(pinn_kickoff, ev.kickoff_utc, window_min):
+            if not (score >= ABBR_SCORE and ev.status == "HT"):
+                continue
         if score > best_score:
             best_score = score
             best = ev
     if best is not None and best_score >= threshold:
         return best
     return None
+
+
+_WOMEN_LEAGUE = re.compile(r"women|femen|femin|frauen|nwsl|liga f\b", re.I)
+
+
+def _is_women_league(league: str) -> bool:
+    return bool(league and _WOMEN_LEAGUE.search(league))
+
+
+def _strip_women(n: str) -> str:
+    return n[:-2] if n.endswith(" w") else n
